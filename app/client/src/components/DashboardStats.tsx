@@ -1,6 +1,8 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { TrendingUp, TrendingDown, Activity, MapPin, AlertTriangle } from "lucide-react";
+import { TrendingUp, TrendingDown, Activity, MapPin, AlertTriangle, RefreshCw } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import type { DashboardStats as ApiDashboardStats } from "@/lib/api";
 
 interface StatCardProps {
   title: string;
@@ -44,18 +46,31 @@ function StatCard({ title, value, change, changeLabel, icon: Icon, className = "
 
 interface DashboardStatsProps {
   className?: string;
+  stats?: ApiDashboardStats;
+  isLoading?: boolean;
+  onRefresh?: () => void;
 }
 
-export function DashboardStats({ className = "" }: DashboardStatsProps) {
-  // TODO: remove mock functionality - replace with real data
-  const stats = {
+export function DashboardStats({ 
+  className = "", 
+  stats: liveStats, 
+  isLoading = false, 
+  onRefresh 
+}: DashboardStatsProps) {
+  // Use live data or fallback to mock data
+  const displayStats = liveStats || {
     totalSites: 24,
-    sitesChange: 8.3,
     healthySites: 18,
-    healthyChange: 5.2,
-    activePredictions: 1247,
-    predictionsChange: 12.1,
+    totalPredictions: 1247,
     activeAlerts: 3,
+    globalAverage: 84.7
+  };
+
+  // Mock change data (in real app, this would come from historical comparison)
+  const changeData = {
+    sitesChange: 8.3,
+    healthyChange: 5.2,
+    predictionsChange: 12.1,
     alertsChange: -25.0
   };
 
@@ -63,34 +78,36 @@ export function DashboardStats({ className = "" }: DashboardStatsProps) {
     <div className={`grid gap-4 md:grid-cols-2 lg:grid-cols-4 ${className}`} data-testid="dashboard-stats">
       <StatCard
         title="Total Sites"
-        value={stats.totalSites}
-        change={stats.sitesChange}
+        value={isLoading ? "..." : displayStats.totalSites}
+        change={changeData.sitesChange}
         changeLabel="from last month"
         icon={MapPin}
       />
       
       <StatCard
         title="Healthy Sites"
-        value={stats.healthySites}
-        change={stats.healthyChange}
+        value={isLoading ? "..." : displayStats.healthySites}
+        change={changeData.healthyChange}
         changeLabel="from last month"
         icon={Activity}
+        className="border-green-200"
       />
       
       <StatCard
         title="Total Predictions"
-        value={stats.activePredictions.toLocaleString()}
-        change={stats.predictionsChange}
+        value={isLoading ? "..." : displayStats.totalPredictions}
+        change={changeData.predictionsChange}
         changeLabel="from last month"
         icon={TrendingUp}
       />
       
       <StatCard
         title="Active Alerts"
-        value={stats.activeAlerts}
-        change={stats.alertsChange}
+        value={isLoading ? "..." : displayStats.activeAlerts}
+        change={changeData.alertsChange}
         changeLabel="from last month"
         icon={AlertTriangle}
+        className="border-red-200"
       />
     </div>
   );

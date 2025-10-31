@@ -2,7 +2,8 @@ import { useEffect, useRef } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { useSites } from '@/contexts/SitesContext';
+import { useQuery } from '@tanstack/react-query';
+import { apiService, type ReefSite } from '@/lib/api';
 
 const DEFAULT_CENTER: [number, number] = [-20.0, 140.0];
 const DEFAULT_ZOOM = 4;
@@ -45,11 +46,16 @@ const createCustomIcon = (health: string) => {
 
 interface SiteMapProps {
   className?: string;
-  onSiteSelect?: (site: any) => void;
+  onSiteSelect?: (site: ReefSite) => void;
 }
 
 export function SiteMap({ className = '', onSiteSelect }: SiteMapProps) {
-  const { sites } = useSites();
+  const { data: sites = [], isLoading } = useQuery({
+    queryKey: ['sites'],
+    queryFn: () => apiService.getSites(),
+    refetchInterval: 60000, // Refresh every minute
+  });
+  
   const mapRef = useRef<L.Map | null>(null);
   const markersRef = useRef<L.Marker[]>([]);
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -98,13 +104,13 @@ export function SiteMap({ className = '', onSiteSelect }: SiteMapProps) {
     markersRef.current = [];
 
     // Add new markers
-    sites.forEach(site => {
+    sites.forEach((site: ReefSite) => {
       if (!site.lat || !site.lng) return;
 
       const marker = L.marker(
         [site.lat, site.lng],
         { 
-          icon: createCustomIcon(site.lastHealth),
+          icon: createCustomIcon(site.lastHealth || 'ambient'),
           title: site.name,
         }
       );
@@ -114,10 +120,10 @@ export function SiteMap({ className = '', onSiteSelect }: SiteMapProps) {
         <div class="space-y-1">
           <h4 class="font-semibold text-sm">${site.name}</h4>
           <div class="text-xs">
-            <div>Status: <span class="font-medium">${site.lastHealth}</span></div>
-            <div>Confidence: <span class="font-medium">${site.lastConfidence.toFixed(1)}%</span></div>
+            <div>Status: <span class="font-medium">${site.lastHealth || 'ambient'}</span></div>
+            <div>Confidence: <span class="font-medium">${(site.lastConfidence || 75).toFixed(1)}%</span></div>
             <div class="text-muted-foreground text-xs mt-1">
-              Updated: ${new Date(site.lastUpdated).toLocaleString()}
+              Updated: ${new Date(site.lastUpdated || site.createdAt).toLocaleString()}
             </div>
           </div>
         </div>
@@ -136,17 +142,23 @@ export function SiteMap({ className = '', onSiteSelect }: SiteMapProps) {
 
     // Fit bounds if we have markers
     if (sites.length > 0) {
-      const bounds = L.latLngBounds(
-        sites.map(site => [site.lat, site.lng] as [number, number])
-      );
-      mapRef.current.fitBounds(bounds, { padding: [50, 50] });
+      const validSites = sites.filter((site: ReefSite) => site.lat && site.lng);
+      if (validSites.length > 0) {
+        const bounds = L.latLngBounds(
+          validSites.map((site: ReefSite) => [site.lat!, site.lng!] as [number, number])
+        );
+        mapRef.current.fitBounds(bounds, { padding: [50, 50] });
+      }
     }
   }, [sites, onSiteSelect]);
 
   return (
     <Card className={className}>
       <CardHeader className="pb-2">
-        <CardTitle className="text-lg">Reef Health Map</CardTitle>
+        <CardTitle className="text-lg">
+          Reef Health Map
+          {isLoading && <span className="text-sm font-normal text-muted-foreground ml-2">Loading sites...</span>}
+        </CardTitle>
       </CardHeader>
       <CardContent className="p-0">
         <div 

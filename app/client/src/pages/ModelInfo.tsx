@@ -56,25 +56,25 @@ export default function ModelInfo() {
 
       // Mock API response
       const mockModelInfo: ModelInfo = {
-        model_path: '/models/surfperch-v2.1.pkl',
-        model_name: 'SurfPerch',
-        version: '2.1.3',
+        model_path: '/models/aqualisten-v1.0.pkl',
+        model_name: 'AquaListen',
+        version: '1.0.0',
         supported_formats: ['.wav', '.mp3', '.m4a', '.flac'],
         max_file_size_mb: 100,
         processing_timeout_seconds: 120,
         sample_rate: 44100,
         model_loaded: true,
         performance_metrics: {
-          accuracy: 0.923,
-          precision: 0.891,
-          recall: 0.876,
-          f1_score: 0.883
+          accuracy: 0.823,
+          precision: 0.819,
+          recall: 0.825,
+          f1_score: 0.822
         },
         training_data: {
-          total_samples: 15420,
-          healthy_samples: 8934,
-          stressed_samples: 4521,
-          ambient_samples: 1965
+          total_samples: 57000,
+          healthy_samples: 32000,
+          stressed_samples: 18000,
+          ambient_samples: 7000
         }
       };
 

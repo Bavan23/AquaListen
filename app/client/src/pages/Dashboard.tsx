@@ -1,8 +1,10 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { apiService, type DashboardStats as ApiDashboardStats, type RecentPrediction } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { DashboardStats } from '@/components/DashboardStats';
+import { DashboardStats as DashboardStatsComponent } from '@/components/DashboardStats';
 import { HealthStatusCard } from '@/components/HealthStatusCard';
 import { QuickUploadModal } from '@/components/QuickUploadModal';
 import { ModelStatusBanner } from '@/components/ModelStatusBanner';
@@ -15,7 +17,21 @@ import heroImage from '@assets/generated_images/Healthy_coral_reef_hero_4141e0bb
 export default function Dashboard() {
   const [modelStatus, setModelStatus] = useState<'loaded' | 'loading' | 'error'>('loaded');
 
-  // TODO: remove mock functionality - replace with real data
+  // Fetch live dashboard data
+  const { data: dashboardStats, isLoading: statsLoading, refetch: refetchStats } = useQuery({
+    queryKey: ['dashboardStats'],
+    queryFn: () => apiService.getDashboardStats(),
+    refetchInterval: 30000, // Refresh every 30 seconds
+    staleTime: 10000, // Consider data stale after 10 seconds
+  });
+
+  const { data: recentPredictions, isLoading: predictionsLoading } = useQuery({
+    queryKey: ['recentPredictions'],
+    queryFn: () => apiService.getRecentPredictions(5),
+    refetchInterval: 15000, // Refresh every 15 seconds
+  });
+
+  // TODO: remove mock functionality - replace with real data (keeping for trend chart)
   const mockTrendData = [
     { date: '2024-01-01', healthy: 65, stressed: 25, ambient: 10, avgConfidence: 78 },
     { date: '2024-01-05', healthy: 70, stressed: 20, ambient: 10, avgConfidence: 82 },
@@ -120,8 +136,17 @@ export default function Dashboard() {
             </div>
             <div className="flex items-center space-x-4">
               <QuickUploadModal onUpload={handleQuickUpload} />
-              <Button variant="outline" className="bg-white/10 border-white/20 text-white hover:bg-white/20">
-                <RefreshCw className="w-4 h-4 mr-2" />
+              <Button 
+                variant="outline" 
+                className="bg-white/10 border-white/20 text-white hover:bg-white/20"
+                onClick={() => {
+                  refetchStats();
+                  // Also refresh predictions
+                  window.location.reload(); // Simple refresh for now
+                }}
+                disabled={statsLoading}
+              >
+                <RefreshCw className={`w-4 h-4 mr-2 ${statsLoading ? 'animate-spin' : ''}`} />
                 Refresh Data
               </Button>
             </div>
@@ -130,7 +155,11 @@ export default function Dashboard() {
       </div>
 
       {/* Dashboard Stats */}
-      <DashboardStats />
+      <DashboardStatsComponent 
+        stats={dashboardStats}
+        isLoading={statsLoading}
+        onRefresh={refetchStats}
+      />
 
       {/* Main Content Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -150,16 +179,26 @@ export default function Dashboard() {
               </div>
             </CardHeader>
             <CardContent className="space-y-4">
-              {mockRecentPredictions.map(prediction => (
-                <HealthStatusCard
-                  key={prediction.id}
-                  status={prediction.status}
-                  confidence={prediction.confidence}
-                  filename={prediction.filename}
-                  site={prediction.site}
-                  timestamp={prediction.timestamp}
-                />
-              ))}
+              {predictionsLoading ? (
+                <div className="text-center py-4 text-muted-foreground">
+                  Loading recent predictions...
+                </div>
+              ) : recentPredictions && recentPredictions.length > 0 ? (
+                recentPredictions.map(prediction => (
+                  <HealthStatusCard
+                    key={prediction.id}
+                    status={prediction.healthStatus}
+                    confidence={prediction.confidence * 100}
+                    filename={prediction.filename}
+                    site={prediction.siteName}
+                    timestamp={prediction.createdAt}
+                  />
+                ))
+              ) : (
+                <div className="text-center py-4 text-muted-foreground">
+                  No recent predictions available
+                </div>
+              )}
             </CardContent>
           </Card>
 
