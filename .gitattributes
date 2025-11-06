@@ -1,1 +1,4 @@
 *.exe filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+savedmodel/variables/* filter=lfs diff=lfs merge=lfs -text
+*.data-* filter=lfs diff=lfs merge=lfs -text
