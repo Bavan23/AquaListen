@@ -38,7 +38,7 @@ AquaListen is a cutting-edge marine conservation tool that uses machine learning
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/your-username/AquaListen.git
+   git clone https://github.com/Bavan23/AquaListen.git
    cd AquaListen
    ```
 
@@ -155,3 +155,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Project Lead**: [Bavan]
 - **Email**: [bavan2312@gmail.com]
 - **Website**: [https://aqualisten.org](https://aqualisten.org)
+
+---
+
+**🌊 Protecting coral reefs through innovative acoustic monitoring technology**
