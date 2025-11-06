@@ -11,6 +11,7 @@ import { HealthStatusCard } from '@/components/HealthStatusCard';
 import { Badge } from '@/components/ui/badge';
 import { Upload as UploadIcon, Play, Pause, Download, RotateCcw } from 'lucide-react';
 import { useSites } from "@/contexts/SitesContext";
+import { apiService } from '@/lib/api';
 
 export default function Upload() {
   const { addSite } = useSites();
@@ -49,26 +50,8 @@ export default function Upload() {
     setPredictionResult(null);
     
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-      
-      // Make API call to FastAPI backend
-      const response = await fetch('http://127.0.0.1:8000/predict', {
-        method: 'POST',
-        body: formData,
-      });
-      
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
-      }
-      
-      const result = await response.json();
-      
-      // Ensure the response matches our expected format
-      if (!result.success) {
-        throw new Error(result.detail || 'Prediction failed');
-      }
+      // Use the API service which handles the correct URL and error handling
+      const result = await apiService.uploadAudio(file);
       
       console.log('API Response:', result);
       setPredictionResult(result);

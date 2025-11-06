@@ -1,5 +1,7 @@
 // AquaListen API Service
-const API_BASE_URL = 'http://localhost:8000';
+// Two backends: Python FastAPI (ML) on 8000, Node.js Express (Database) on 3002
+const ML_API_BASE_URL = 'http://localhost:8000';      // Python FastAPI for ML inference
+const DB_API_BASE_URL = 'http://localhost:3002';      // Node.js Express for database operations
 
 export interface DashboardStats {
   totalSites: number;
@@ -46,25 +48,40 @@ export interface Alert {
 }
 
 class ApiService {
-  private async fetchApi<T>(endpoint: string): Promise<T> {
+  // Database operations (Node.js Express backend)
+  private async fetchDbApi<T>(endpoint: string): Promise<T> {
     try {
-      const response = await fetch(`${API_BASE_URL}${endpoint}`);
+      const response = await fetch(`${DB_API_BASE_URL}${endpoint}`);
       if (!response.ok) {
-        throw new Error(`API Error: ${response.status} ${response.statusText}`);
+        throw new Error(`DB API Error: ${response.status} ${response.statusText}`);
       }
       return await response.json();
     } catch (error) {
-      console.error(`Failed to fetch ${endpoint}:`, error);
+      console.error(`Failed to fetch DB ${endpoint}:`, error);
+      throw error;
+    }
+  }
+
+  // ML operations (Python FastAPI backend)
+  private async fetchMlApi<T>(endpoint: string): Promise<T> {
+    try {
+      const response = await fetch(`${ML_API_BASE_URL}${endpoint}`);
+      if (!response.ok) {
+        throw new Error(`ML API Error: ${response.status} ${response.statusText}`);
+      }
+      return await response.json();
+    } catch (error) {
+      console.error(`Failed to fetch ML ${endpoint}:`, error);
       throw error;
     }
   }
 
   async getDashboardStats(): Promise<DashboardStats> {
-    return this.fetchApi<DashboardStats>('/dashboard/stats');
+    return this.fetchDbApi<DashboardStats>('/dashboard/stats');
   }
 
   async getAllSites(): Promise<ReefSite[]> {
-    return this.fetchApi<ReefSite[]>('/sites');
+    return this.fetchDbApi<ReefSite[]>('/sites');
   }
 
   async getSites(): Promise<ReefSite[]> {
@@ -92,11 +109,11 @@ class ApiService {
   }
 
   async getRecentPredictions(limit: number = 10): Promise<RecentPrediction[]> {
-    return this.fetchApi<RecentPrediction[]>(`/predictions/recent?limit=${limit}`);
+    return this.fetchDbApi<RecentPrediction[]>(`/predictions/recent?limit=${limit}`);
   }
 
   async getAllAlerts(): Promise<Alert[]> {
-    return this.fetchApi<Alert[]>('/alerts');
+    return this.fetchDbApi<Alert[]>('/alerts');
   }
 
   async uploadAudio(file: File): Promise<any> {
@@ -104,7 +121,7 @@ class ApiService {
     formData.append('file', file);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/predict`, {
+      const response = await fetch(`${ML_API_BASE_URL}/predict`, {
         method: 'POST',
         body: formData,
       });
@@ -121,11 +138,11 @@ class ApiService {
   }
 
   async getModelInfo(): Promise<any> {
-    return this.fetchApi<any>('/model/info');
+    return this.fetchMlApi<any>('/model/info');
   }
 
   async checkHealth(): Promise<any> {
-    return this.fetchApi<any>('/health');
+    return this.fetchMlApi<any>('/health');
   }
 }
 

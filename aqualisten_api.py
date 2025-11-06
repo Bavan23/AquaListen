@@ -26,14 +26,46 @@ import os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Import Python storage system
-try:
-    from storage_system import storage
-    logger.info("Storage system loaded successfully")
-except ImportError:
-    # Fallback if storage import fails
-    storage = None
-    logger.warning("Storage system not available - using fallback mode")
+# Simple HTTP client to communicate with Node.js backend
+import requests
+import json
+
+class SimpleNodeJSStorage:
+    def __init__(self):
+        self.base_url = "http://localhost:3002"
+    
+    async def getAllSites(self):
+        try:
+            response = requests.get(f"{self.base_url}/sites", timeout=5)
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            logger.warning(f"Failed to get sites from Node.js: {e}")
+        return []
+    
+    async def createPrediction(self, prediction_data):
+        try:
+            # Send prediction data to Node.js backend
+            payload = {
+                "siteId": prediction_data.get("siteId"),
+                "filename": prediction_data.get("filename"),
+                "healthStatus": prediction_data.get("healthStatus"),
+                "confidence": prediction_data.get("confidence"),
+                "audioFeatures": str(prediction_data.get("audioFeatures", {})),
+                "processingTime": prediction_data.get("processingTime", 0)
+            }
+            
+            response = requests.post(f"{self.base_url}/api/predictions", json=payload, timeout=10)
+            if response.status_code == 200:
+                logger.info(f"✅ Prediction saved via Node.js: {prediction_data.get('filename')}")
+                return response.json()
+        except Exception as e:
+            logger.warning(f"Failed to save prediction to Node.js: {e}")
+        return {}
+
+# Create storage instance
+storage = SimpleNodeJSStorage()
+logger.info("Simple Node.js storage client initialized")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -46,8 +78,11 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3001",  # React dev server
-        "http://127.0.0.1:3001",  # Alternative localhost
+        "http://localhost:5173",  # React dev server (Vite)
+        "http://127.0.0.1:5173",  # Alternative localhost
+        "http://localhost:3002",  # Node.js backend
+        "http://127.0.0.1:3002",  # Alternative localhost
+        "*"  # Allow all origins for development
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -586,7 +621,13 @@ async def predict_reef_health(file: UploadFile = File(...)):
                     "filename": file.filename,
                     "healthStatus": health_status,
                     "confidence": confidence,
-                    "processingTime": time.time() - start_time
+                    "processingTime": time.time() - start_time,
+                    "fileSize": len(file_contents),
+                    "duration": len(audio) / sr if sr > 0 else 0,
+                    "sampleRate": sr,
+                    "audioFeatures": str(features),
+                    "uploadedBy": "user",
+                    "modelUsed": "AquaListen-v1.0"
                 })
                 logger.info("Prediction saved to storage")
             except Exception as e:
@@ -796,21 +837,47 @@ async def get_alerts():
         
         result = []
         for alert in alerts:
-            site = site_map.get(alert["siteId"]) if alert.get("siteId") else None
+            site = site_map.get(alert.get("siteId"), {})
             result.append({
                 "id": alert["id"],
                 "message": alert["message"],
                 "severity": alert["severity"],
                 "alertType": alert["alertType"],
-                "siteName": site["name"] if site else "Unknown Site",
+                "siteName": site.get("name", "Unknown Site"),
                 "isRead": alert["isRead"] == 1,
                 "createdAt": alert["createdAt"]
             })
         
-        return sorted(result, key=lambda a: a["createdAt"] or "", reverse=True)
+        return result
     except Exception as e:
         logger.error(f"Error fetching alerts: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch alerts")
+        return []
+
+@app.get("/uploads")
+async def get_uploaded_files():
+    """Get all uploaded files and their predictions"""
+    if not storage:
+        return []
+    
+    try:
+        predictions = await storage.getAllPredictions()
+        return predictions
+    except Exception as e:
+        logger.error(f"Error fetching uploaded files: {e}")
+        return []
+
+@app.get("/uploads/recent")
+async def get_recent_uploads(limit: int = 10):
+    """Get recent uploaded files"""
+    if not storage:
+        return []
+    
+    try:
+        recent_predictions = await storage.getRecentPredictions(limit)
+        return recent_predictions
+    except Exception as e:
+        logger.error(f"Error fetching recent uploads: {e}")
+        return []
 
 # ============================================================================
 # RUN THE SERVER
