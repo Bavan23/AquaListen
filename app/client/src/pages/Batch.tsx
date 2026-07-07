@@ -76,34 +76,50 @@ export default function Batch() {
       f.id === fileId ? { ...f, status: 'processing', progress: 0 } : f
     ));
 
-    // TODO: remove mock functionality - replace with real API call
     try {
-      // Simulate processing with progress updates
-      for (let progress = 0; progress <= 100; progress += Math.random() * 15 + 5) {
-        if (progress > 100) progress = 100;
-        
-        setBatchFiles(prev => prev.map(f => 
-          f.id === fileId ? { ...f, progress } : f
-        ));
-        
-        await new Promise(resolve => setTimeout(resolve, 100));
+      const file = batchFiles.find(f => f.id === fileId)?.file;
+      if (!file) throw new Error('File not found');
+
+      // Create FormData for API call
+      const formData = new FormData();
+      formData.append('file', file);
+
+      // Update progress to show we're starting
+      setBatchFiles(prev => prev.map(f => 
+        f.id === fileId ? { ...f, progress: 25 } : f
+      ));
+
+      // Call the real ML API
+      const response = await fetch('http://localhost:8000/predict', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`API Error: ${response.status} ${response.statusText}`);
       }
 
-      // Simulate API response
-      const mockResult = {
-        health_status: ['healthy', 'stressed', 'ambient'][Math.floor(Math.random() * 3)] as any,
-        confidence: Math.random() * 40 + 60, // 60-100%
-        processing_time: Math.random() * 5 + 1
+      // Update progress
+      setBatchFiles(prev => prev.map(f => 
+        f.id === fileId ? { ...f, progress: 75 } : f
+      ));
+
+      const result = await response.json();
+
+      if (!result.success) {
+        throw new Error(result.error || 'Prediction failed');
+      }
+
+      // Extract the prediction data
+      const apiResult = {
+        health_status: result.prediction.health_status,
+        confidence: result.prediction.confidence * 100, // Convert to percentage
+        processing_time: result.processing.processing_time_seconds
       };
-
-      // Random chance of error for demonstration
-      if (Math.random() < 0.1) {
-        throw new Error('Processing timeout');
-      }
 
       setBatchFiles(prev => prev.map(f => 
         f.id === fileId 
-          ? { ...f, status: 'completed', progress: 100, result: mockResult }
+          ? { ...f, status: 'completed', progress: 100, result: apiResult }
           : f
       ));
 

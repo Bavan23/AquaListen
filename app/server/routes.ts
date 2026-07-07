@@ -137,39 +137,44 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Audio prediction endpoint (matches frontend expectation)
+  // Audio prediction endpoint — proxy to Python ML backend
   app.post('/predict', async (req, res) => {
     try {
-      // For now, create a sample prediction to test the database
-      // Later this will process the actual audio file
-      const samplePrediction = await storage.createPrediction({
-        filename: `uploaded_${Date.now()}.wav`,
-        healthStatus: Math.random() > 0.5 ? 'healthy' : 'stressed',
-        confidence: Math.random() * 0.4 + 0.6, // 60-100% confidence
-        siteId: null,
-        audioFeatures: JSON.stringify({ 
-          spectral_centroid: Math.random() * 1000,
-          mfcc_mean: Math.random() * 10 
-        }),
-        processingTime: Math.random() * 5 + 2 // 2-7 seconds
+      // Forward the entire request to the Python FastAPI ML backend
+      const pythonUrl = 'http://localhost:8000/predict';
+
+      // Re-assemble the multipart body from Express and forward it
+      // Since Express may have already parsed the body, we pipe the raw request
+      const fetch = (await import('node-fetch')).default;
+      const FormData = (await import('form-data')).default;
+
+      // If multer or similar parsed the file, reconstruct FormData
+      // Otherwise, pipe the raw request through
+      const headers: Record<string, string> = {};
+      if (req.headers['content-type']) {
+        headers['content-type'] = req.headers['content-type'] as string;
+      }
+
+      // Pipe the raw request body to the Python backend
+      const proxyResponse = await fetch(pythonUrl, {
+        method: 'POST',
+        headers,
+        body: req,
       });
-      
-      // Return in format expected by frontend
-      res.json({
-        success: true,
-        prediction: {
-          health_status: samplePrediction.healthStatus,
-          confidence: samplePrediction.confidence,
-          processing_time: samplePrediction.processingTime,
-          audio_features: JSON.parse(samplePrediction.audioFeatures || '{}')
-        },
-        filename: samplePrediction.filename,
-        timestamp: samplePrediction.createdAt
-      });
+
+      const data = await proxyResponse.json();
+
+      if (!proxyResponse.ok) {
+        res.status(proxyResponse.status).json(data);
+        return;
+      }
+
+      res.json(data);
     } catch (error) {
-      res.status(500).json({ 
+      console.error('❌ Failed to proxy predict to Python:', error);
+      res.status(502).json({ 
         success: false,
-        detail: error instanceof Error ? error.message : 'Unknown error' 
+        detail: 'ML backend (Python :8000) is unavailable. Ensure the FastAPI server is running.' 
       });
     }
   });
@@ -227,18 +232,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         processingTime: predictionData.processingTime || 0
       });
 
-      // Create alert if stressed reef detected
-      if (predictionData.healthStatus === 'stressed' && predictionData.confidence > 0.7) {
-        await storage.createAlert({
-          siteId: predictionData.siteId,
-          predictionId: prediction.id,
-          alertType: 'stress_detected',
-          message: `Reef stress detected in ${predictionData.filename} with ${(predictionData.confidence * 100).toFixed(1)}% confidence`,
-          severity: predictionData.confidence > 0.8 ? 'high' : 'medium',
-          isRead: 0
-        });
-        console.log('🚨 Alert created for stressed reef');
-      }
+      // NOTE: Alert creation is handled inside MongoStorage.createPrediction()
+      // Do NOT create alerts here — that caused duplicate alerts.
 
       res.json({
         success: true,

@@ -16,82 +16,39 @@ import {
   AlertTriangle,
   Info
 } from 'lucide-react';
+import { apiService } from '@/lib/api';
 
-interface ModelInfo {
+// Matches the shape returned by GET :8000/model/info
+interface ModelInfoData {
+  model_loaded?: boolean;
   model_path?: string;
-  model_name?: string;
-  version?: string;
+  classification_categories?: string[];
   supported_formats?: string[];
   max_file_size_mb?: number;
   processing_timeout_seconds?: number;
-  sample_rate?: number;
-  model_loaded?: boolean;
-  performance_metrics?: {
-    accuracy?: number;
-    precision?: number;
-    recall?: number;
-    f1_score?: number;
-  };
-  training_data?: {
-    total_samples?: number;
-    healthy_samples?: number;
-    stressed_samples?: number;
-    ambient_samples?: number;
-  };
+  available_data?: Record<string, { shape: [number, number]; columns: string[] }>;
+  // Cached model signature info
+  model_signature?: Record<string, { inputs: string; outputs: string }>;
 }
 
 export default function ModelInfo() {
-  const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
+  const [modelInfo, setModelInfo] = useState<ModelInfoData | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [csvData, setCsvData] = useState<any[]>([]);
 
   const fetchModelInfo = async () => {
     setIsLoading(true);
     setError(null);
 
     try {
-      // TODO: remove mock functionality - replace with real API call
-      await new Promise(resolve => setTimeout(resolve, 1500));
-
-      // Mock API response
-      const mockModelInfo: ModelInfo = {
-        model_path: '/models/aqualisten-v1.0.pkl',
-        model_name: 'AquaListen',
-        version: '1.0.0',
-        supported_formats: ['.wav', '.mp3', '.m4a', '.flac'],
-        max_file_size_mb: 100,
-        processing_timeout_seconds: 120,
-        sample_rate: 44100,
-        model_loaded: true,
-        performance_metrics: {
-          accuracy: 0.823,
-          precision: 0.819,
-          recall: 0.825,
-          f1_score: 0.822
-        },
-        training_data: {
-          total_samples: 57000,
-          healthy_samples: 32000,
-          stressed_samples: 18000,
-          ambient_samples: 7000
-        }
-      };
-
-      // Mock CSV data preview
-      const mockCsvData = [
-        { id: 1, filename: 'reef_001.wav', health: 'healthy', confidence: 0.923, site: 'GBR-A' },
-        { id: 2, filename: 'reef_002.wav', health: 'stressed', confidence: 0.789, site: 'CB-B' },
-        { id: 3, filename: 'reef_003.wav', health: 'ambient', confidence: 0.856, site: 'NR-C' },
-        { id: 4, filename: 'reef_004.wav', health: 'healthy', confidence: 0.934, site: 'HI-D' },
-        { id: 5, filename: 'reef_005.wav', health: 'stressed', confidence: 0.723, site: 'LI-E' }
-      ];
-
-      setModelInfo(mockModelInfo);
-      setCsvData(mockCsvData);
-      
+      const data = await apiService.getModelInfo();
+      setModelInfo(data);
     } catch (err) {
-      setError('Failed to fetch model information');
+      setError(
+        err instanceof Error
+          ? `Failed to connect to ML backend: ${err.message}`
+          : 'Failed to fetch model information'
+      );
       console.error('Model info fetch error:', err);
     } finally {
       setIsLoading(false);
@@ -114,7 +71,7 @@ export default function ModelInfo() {
         <Card>
           <CardContent className="p-8 text-center">
             <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-            <p>Fetching model information...</p>
+            <p>Fetching model information from ML backend...</p>
           </CardContent>
         </Card>
       </div>
@@ -152,7 +109,7 @@ export default function ModelInfo() {
         <div>
           <h1 className="text-3xl font-bold">Model Information</h1>
           <p className="text-muted-foreground mt-1">
-            Detailed information about the reef health prediction model
+            Live information from the AquaListen ML backend
           </p>
         </div>
         <Button onClick={fetchModelInfo} variant="outline" data-testid="button-refresh">
@@ -165,10 +122,10 @@ export default function ModelInfo() {
       <Alert className={modelInfo.model_loaded ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'}>
         {modelInfo.model_loaded ? <CheckCircle className="h-4 w-4 text-green-600" /> : <AlertTriangle className="h-4 w-4 text-red-600" />}
         <AlertDescription>
-          <strong>Model Status:</strong> {modelInfo.model_loaded ? 'Loaded and Ready' : 'Not Loaded'}
+          <strong>Model Status:</strong> {modelInfo.model_loaded ? 'Loaded and Ready' : 'Not Loaded — using fallback classification'}
           {!modelInfo.model_loaded && (
             <span className="block mt-1 text-sm">
-              The model is not currently loaded. Contact an administrator to load the model for predictions.
+              The TensorFlow SavedModel could not be loaded. The API will use fallback heuristic classification.
             </span>
           )}
         </AlertDescription>
@@ -188,15 +145,33 @@ export default function ModelInfo() {
               <div>
                 <h4 className="font-medium text-sm text-muted-foreground">Model Name</h4>
                 <p className="text-lg font-semibold" data-testid="text-model-name">
-                  {modelInfo.model_name} v{modelInfo.version}
+                  AquaListen (Google SurfPerch)
                 </p>
               </div>
               
               <div>
                 <h4 className="font-medium text-sm text-muted-foreground">Model Path</h4>
-                <p className="font-mono text-sm" data-testid="text-model-path">
-                  {modelInfo.model_path}
+                <p className="font-mono text-sm break-all" data-testid="text-model-path">
+                  {modelInfo.model_path || 'N/A'}
                 </p>
+              </div>
+
+              <div>
+                <h4 className="font-medium text-sm text-muted-foreground">Classification Categories</h4>
+                <div className="flex flex-wrap gap-2 mt-2">
+                  {modelInfo.classification_categories?.map(cat => (
+                    <Badge
+                      key={cat}
+                      className={
+                        cat === 'healthy' ? 'bg-green-100 text-green-800' :
+                        cat === 'stressed' ? 'bg-red-100 text-red-800' :
+                        'bg-blue-100 text-blue-800'
+                      }
+                    >
+                      {cat}
+                    </Badge>
+                  ))}
+                </div>
               </div>
 
               <div>
@@ -217,15 +192,15 @@ export default function ModelInfo() {
                 <div className="space-y-2 mt-2">
                   <div className="flex items-center space-x-2">
                     <HardDrive className="w-4 h-4 text-muted-foreground" />
-                    <span className="text-sm">Max File Size: {modelInfo.max_file_size_mb} MB</span>
+                    <span className="text-sm">Max File Size: {modelInfo.max_file_size_mb ?? 'N/A'} MB</span>
                   </div>
                   <div className="flex items-center space-x-2">
                     <Clock className="w-4 h-4 text-muted-foreground" />
-                    <span className="text-sm">Timeout: {modelInfo.processing_timeout_seconds}s</span>
+                    <span className="text-sm">Timeout: {modelInfo.processing_timeout_seconds ?? 'N/A'}s</span>
                   </div>
                   <div className="flex items-center space-x-2">
                     <Zap className="w-4 h-4 text-muted-foreground" />
-                    <span className="text-sm">Sample Rate: {modelInfo.sample_rate}Hz</span>
+                    <span className="text-sm">Input: 10s @ 16 kHz (160,000 samples)</span>
                   </div>
                 </div>
               </div>
@@ -234,135 +209,87 @@ export default function ModelInfo() {
         </CardContent>
       </Card>
 
-      {/* Performance Metrics */}
-      {modelInfo.performance_metrics && (
-        <Card data-testid="card-performance">
-          <CardHeader>
-            <CardTitle className="flex items-center space-x-2">
-              <CheckCircle className="w-5 h-5" />
-              <span>Performance Metrics</span>
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
-              <div className="text-center">
-                <div className="text-2xl font-bold text-green-600">
-                  {(modelInfo.performance_metrics.accuracy! * 100).toFixed(1)}%
-                </div>
-                <div className="text-sm text-muted-foreground">Accuracy</div>
-                <Progress value={modelInfo.performance_metrics.accuracy! * 100} className="mt-2" />
-              </div>
-              
-              <div className="text-center">
-                <div className="text-2xl font-bold text-blue-600">
-                  {(modelInfo.performance_metrics.precision! * 100).toFixed(1)}%
-                </div>
-                <div className="text-sm text-muted-foreground">Precision</div>
-                <Progress value={modelInfo.performance_metrics.precision! * 100} className="mt-2" />
-              </div>
-              
-              <div className="text-center">
-                <div className="text-2xl font-bold text-purple-600">
-                  {(modelInfo.performance_metrics.recall! * 100).toFixed(1)}%
-                </div>
-                <div className="text-sm text-muted-foreground">Recall</div>
-                <Progress value={modelInfo.performance_metrics.recall! * 100} className="mt-2" />
-              </div>
-              
-              <div className="text-center">
-                <div className="text-2xl font-bold text-orange-600">
-                  {(modelInfo.performance_metrics.f1_score! * 100).toFixed(1)}%
-                </div>
-                <div className="text-sm text-muted-foreground">F1 Score</div>
-                <Progress value={modelInfo.performance_metrics.f1_score! * 100} className="mt-2" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Training Data */}
-      {modelInfo.training_data && (
-        <Card data-testid="card-training-data">
+      {/* Available CSV Data */}
+      {modelInfo.available_data && Object.keys(modelInfo.available_data).length > 0 && (
+        <Card data-testid="card-csv-data">
           <CardHeader>
             <CardTitle className="flex items-center space-x-2">
               <Database className="w-5 h-5" />
-              <span>Training Dataset</span>
+              <span>Loaded Classification Data</span>
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div className="text-center p-4 bg-muted rounded-lg">
-                <div className="text-2xl font-bold">{modelInfo.training_data.total_samples?.toLocaleString()}</div>
-                <div className="text-sm text-muted-foreground">Total Samples</div>
-              </div>
-              
-              <div className="text-center p-4 bg-green-50 rounded-lg">
-                <div className="text-2xl font-bold text-green-600">{modelInfo.training_data.healthy_samples?.toLocaleString()}</div>
-                <div className="text-sm text-muted-foreground">Healthy</div>
-              </div>
-              
-              <div className="text-center p-4 bg-red-50 rounded-lg">
-                <div className="text-2xl font-bold text-red-600">{modelInfo.training_data.stressed_samples?.toLocaleString()}</div>
-                <div className="text-sm text-muted-foreground">Stressed</div>
-              </div>
-              
-              <div className="text-center p-4 bg-blue-50 rounded-lg">
-                <div className="text-2xl font-bold text-blue-600">{modelInfo.training_data.ambient_samples?.toLocaleString()}</div>
-                <div className="text-sm text-muted-foreground">Ambient</div>
-              </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b">
+                    <th className="text-left p-2">CSV File</th>
+                    <th className="text-left p-2">Rows</th>
+                    <th className="text-left p-2">Columns</th>
+                    <th className="text-left p-2">Sample Columns</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(modelInfo.available_data).map(([filename, info]) => (
+                    <tr key={filename} className="border-b" data-testid={`row-csv-${filename}`}>
+                      <td className="p-2 font-mono text-xs">{filename}</td>
+                      <td className="p-2">{info.shape[0].toLocaleString()}</td>
+                      <td className="p-2">{info.shape[1]}</td>
+                      <td className="p-2">
+                        <div className="flex flex-wrap gap-1">
+                          {info.columns.map(col => (
+                            <Badge key={col} variant="outline" className="text-xs">
+                              {col}
+                            </Badge>
+                          ))}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            
+            <div className="mt-4 p-3 bg-muted rounded text-sm text-muted-foreground">
+              <Info className="w-4 h-4 inline mr-2" />
+              These CSVs are loaded at startup for taxonomy mapping. The primary model is Google SurfPerch (EfficientNet-B0, 10,932 species classes).
             </div>
           </CardContent>
         </Card>
       )}
 
-      {/* Sample Data Preview */}
-      <Card data-testid="card-sample-data">
+      {/* Model Architecture Note */}
+      <Card data-testid="card-architecture">
         <CardHeader>
           <CardTitle className="flex items-center space-x-2">
             <FileText className="w-5 h-5" />
-            <span>Sample Data Preview</span>
+            <span>Architecture Summary</span>
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b">
-                  <th className="text-left p-2">ID</th>
-                  <th className="text-left p-2">Filename</th>
-                  <th className="text-left p-2">Health Status</th>
-                  <th className="text-left p-2">Confidence</th>
-                  <th className="text-left p-2">Site</th>
-                </tr>
-              </thead>
-              <tbody>
-                {csvData.slice(0, 5).map(row => (
-                  <tr key={row.id} className="border-b" data-testid={`row-sample-${row.id}`}>
-                    <td className="p-2">{row.id}</td>
-                    <td className="p-2 font-mono text-xs">{row.filename}</td>
-                    <td className="p-2">
-                      <Badge 
-                        className={
-                          row.health === 'healthy' ? 'bg-green-100 text-green-800' :
-                          row.health === 'stressed' ? 'bg-red-100 text-red-800' :
-                          'bg-blue-100 text-blue-800'
-                        }
-                      >
-                        {row.health}
-                      </Badge>
-                    </td>
-                    <td className="p-2">{(row.confidence * 100).toFixed(1)}%</td>
-                    <td className="p-2">{row.site}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          
-          <div className="mt-4 p-3 bg-muted rounded text-sm text-muted-foreground">
-            <Info className="w-4 h-4 inline mr-2" />
-            Showing first 5 rows of sample data. Full dataset contains {csvData.length} entries.
+          <div className="space-y-3 text-sm">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="p-3 bg-muted rounded-lg">
+                <h4 className="font-semibold mb-1">Backbone</h4>
+                <p className="text-muted-foreground">EfficientNet-B0 with embedded DSP frontend (STFT → Mel → Log)</p>
+              </div>
+              <div className="p-3 bg-muted rounded-lg">
+                <h4 className="font-semibold mb-1">Parameters</h4>
+                <p className="text-muted-foreground">~24.2M trainable parameters</p>
+              </div>
+              <div className="p-3 bg-muted rounded-lg">
+                <h4 className="font-semibold mb-1">Output Heads</h4>
+                <p className="text-muted-foreground">Species (10,932), Genus (2,333), Family (249), Order (41), Class (38)</p>
+              </div>
+              <div className="p-3 bg-muted rounded-lg">
+                <h4 className="font-semibold mb-1">Embedding</h4>
+                <p className="text-muted-foreground">1,280-dimensional feature vector from global average pooling</p>
+              </div>
+            </div>
+            <div className="mt-4 p-3 bg-muted rounded text-sm text-muted-foreground">
+              <Info className="w-4 h-4 inline mr-2" />
+              AquaListen wraps SurfPerch with ecological mapping (Shannon entropy + richness heuristics) and an anthropogenic noise scorer to produce healthy/stressed/ambient classifications.
+            </div>
           </div>
         </CardContent>
       </Card>

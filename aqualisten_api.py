@@ -16,11 +16,47 @@ import numpy as np
 import pandas as pd
 import io
 import logging
+import traceback
 import datetime
 import time
 from pathlib import Path
 import sys
 import os
+
+# ============================================================================
+# CONFIGURABLE THRESHOLDS — Anthropogenic Noise Detection
+# ============================================================================
+# These constants control the anthropogenic noise scoring system.
+# Adjust based on deployment environment, hydrophone sensitivity, and
+# local acoustic conditions. In production, move to config.py / .env / YAML.
+#
+# References:
+#   - Merchant et al. (2015): Ship noise spectral partitioning
+#   - Erbe et al. (2019): Underwater noise from vessels
+#   - Kaplan et al. (2015): ZCR unreliability for marine bioacoustics
+
+# Per-indicator thresholds
+ANTHRO_CENTROID_THRESHOLD = 500       # Hz — boat engines concentrate below this
+ANTHRO_BANDWIDTH_THRESHOLD = 600      # Hz — mechanical sources are narrow-band tonal
+ANTHRO_ZCR_THRESHOLD = 0.03          # Only targets continuous machinery hum (bio sounds: 0.04-0.06)
+ANTHRO_LOWFREQ_CUTOFF = 500          # Hz — boundary for low-frequency energy ratio
+ANTHRO_LOWFREQ_RATIO_THRESHOLD = 0.80 # Energy below cutoff / total energy
+
+# Indicator weights (sum to 1.0)
+# RMS intentionally excluded — recording-dependent, unreliable (loud whale ≠ engine)
+ANTHRO_WEIGHT_CENTROID = 0.30         # Strong: centroid is a direct frequency indicator
+ANTHRO_WEIGHT_BANDWIDTH = 0.20        # Moderate: narrow bandwidth = tonal mechanical source
+ANTHRO_WEIGHT_ZCR = 0.10             # Low: unreliable for marine bioacoustics (Kaplan 2015)
+ANTHRO_WEIGHT_LOWFREQ_RATIO = 0.40   # Strongest: standard PAM indicator (Merchant 2015)
+
+# Fusion policy thresholds
+ANTHRO_SCORE_WARN = 0.3              # Above: log warning, minor confidence reduction
+ANTHRO_SCORE_MODERATE = 0.6          # Above: moderate confidence reduction
+ANTHRO_SCORE_OVERRIDE = 0.8          # Above: may override IF ML confidence is low
+ANTHRO_ML_CONFIDENCE_FLOOR = 0.60    # Only override when ML confidence < this value
+
+# Debug / logging control
+DEBUG_PREDICTIONS = False             # Set True to log top-10 class predictions per request
 
 # Configure logging first
 logging.basicConfig(level=logging.INFO)
@@ -62,6 +98,42 @@ class SimpleNodeJSStorage:
         except Exception as e:
             logger.warning(f"Failed to save prediction to Node.js: {e}")
         return {}
+    
+    async def getDashboardStats(self):
+        try:
+            response = requests.get(f"{self.base_url}/dashboard/stats", timeout=5)
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            logger.warning(f"Failed to get dashboard stats from Node.js: {e}")
+        return {"totalSites": 0, "healthySites": 0, "totalPredictions": 0, "activeAlerts": 0, "globalAverage": 0}
+    
+    async def getAllAlerts(self):
+        try:
+            response = requests.get(f"{self.base_url}/alerts", timeout=5)
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            logger.warning(f"Failed to get alerts from Node.js: {e}")
+        return []
+    
+    async def getAllPredictions(self):
+        try:
+            response = requests.get(f"{self.base_url}/predictions/recent?limit=100", timeout=5)
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            logger.warning(f"Failed to get predictions from Node.js: {e}")
+        return []
+    
+    async def getRecentPredictions(self, limit=10):
+        try:
+            response = requests.get(f"{self.base_url}/predictions/recent?limit={limit}", timeout=5)
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            logger.warning(f"Failed to get recent predictions from Node.js: {e}")
+        return []
 
 # Create storage instance
 storage = SimpleNodeJSStorage()
@@ -94,6 +166,8 @@ app.add_middleware(
 aqualisten_model = None
 reef_classifications = None
 model_loaded = False
+cached_model_signature = None   # Cached at load time — no need to inspect per-request
+latest_embedding = None         # Most recent output_1 embedding (1280-dim), stored for future use
 
 # ============================================================================
 # MODEL LOADING AND INITIALIZATION
@@ -104,24 +178,29 @@ def load_aqualisten_model():
     global aqualisten_model, reef_classifications, model_loaded
     
     try:
-        # Local AquaListen path - using the savedmodel in project directory
-        AQUALISTEN_PATH = Path(__file__).parent / "savedmodel"
+        # Local AquaListen path - models directory contains savedmodel + CSVs
+        MODELS_DIR = Path(__file__).parent / "models"
+        SAVEDMODEL_PATH = MODELS_DIR / "savedmodel"
         
-        logger.info(f"Loading AquaListen model from: {AQUALISTEN_PATH}")
+        logger.info(f"Loading AquaListen model from: {SAVEDMODEL_PATH}")
         
-        # Load SavedModel directly from the savedmodel directory
-        if AQUALISTEN_PATH.exists():
-            aqualisten_model = tf.saved_model.load(str(AQUALISTEN_PATH))
+        # Load SavedModel directly from the models/savedmodel directory
+        if SAVEDMODEL_PATH.exists():
+            aqualisten_model = tf.saved_model.load(str(SAVEDMODEL_PATH))
             logger.info("AquaListen SavedModel loaded successfully")
+            
+            # Cache model signature once at load time (not per-request)
+            _cache_model_signature()
         else:
-            logger.error(f"SavedModel not found at {AQUALISTEN_PATH}")
+            logger.error(f"SavedModel not found at {SAVEDMODEL_PATH}")
             return False
         
         # Load classification data
         try:
             # Load available CSV files for classification mapping
+            # CSVs are in the models/ directory (not inside savedmodel/)
             csv_files = {}
-            for csv_file in Path(AQUALISTEN_PATH).glob("*.csv"):
+            for csv_file in MODELS_DIR.glob("*.csv"):
                 df = pd.read_csv(csv_file)
                 csv_files[csv_file.name] = df
                 logger.info(f"Loaded {csv_file.name}: {df.shape}")
@@ -136,8 +215,9 @@ def load_aqualisten_model():
         logger.info("AquaListen system initialized successfully")
         return True
         
-    except Exception as e:
-        logger.error(f"Failed to load AquaListen model: {e}")
+    except Exception:
+        logger.exception("Failed to load AquaListen model")
+        traceback.print_exc()
         model_loaded = False
         return False
 
@@ -169,35 +249,36 @@ def create_reef_health_mapping():
     
     return reef_health_map
 
-def inspect_model_signature():
+def _cache_model_signature():
     """
-    Inspect the AquaListen model signature to understand expected input format
+    Inspect and cache the model signature at load time.
+    Called once during startup — never per-request.
     """
-    global aqualisten_model
+    global aqualisten_model, cached_model_signature
     
     if aqualisten_model is None:
-        return None
+        return
     
     try:
-        logger.info("=== AquaListen Model Signature Inspection ===")
+        logger.info("=== AquaListen Model Signature (cached at startup) ===")
+        sig_info = {}
         
         if hasattr(aqualisten_model, 'signatures'):
             for sig_name, signature in aqualisten_model.signatures.items():
+                sig_info[sig_name] = {
+                    'inputs': str(signature.structured_input_signature),
+                    'outputs': str(signature.structured_outputs)
+                }
                 logger.info(f"Signature '{sig_name}':")
                 logger.info(f"  Inputs: {signature.structured_input_signature}")
                 logger.info(f"  Outputs: {signature.structured_outputs}")
         
-        # Try to get concrete function info
-        if hasattr(aqualisten_model, 'concrete_functions'):
-            logger.info("Available concrete functions:")
-            for func in aqualisten_model.concrete_functions:
-                logger.info(f"  {func}")
-        
-        return True
+        cached_model_signature = sig_info
+        logger.info("Model signature cached successfully")
         
     except Exception as e:
-        logger.error(f"Error inspecting model signature: {e}")
-        return False
+        logger.error(f"Error caching model signature: {e}")
+        cached_model_signature = {}
 
 def predict_with_aqualisten_model(audio_features):
     """
@@ -210,8 +291,7 @@ def predict_with_aqualisten_model(audio_features):
         return None, None
     
     try:
-        # Inspect model signature first (for debugging)
-        inspect_model_signature()
+        # Signature is cached at startup — no per-request inspection needed
         
         # AquaListen expects RAW AUDIO SAMPLES, not spectrograms!
         # Expected input: (batch_size, 160000) - 10 seconds at 16kHz
@@ -221,66 +301,60 @@ def predict_with_aqualisten_model(audio_features):
             logger.warning("No raw audio available for AquaListen prediction")
             return None, None
         
-        logger.info(f"Raw audio shape: {raw_audio.shape}")
-        logger.info(f"Raw audio length: {len(raw_audio)} samples")
+        logger.info(f"Raw audio: {len(raw_audio)} samples")
         
         # AquaListen expects exactly 160,000 samples (10 seconds at 16kHz)
         target_length = 160000
         
         if len(raw_audio) < target_length:
-            # Pad with zeros if too short
             padded_audio = np.pad(raw_audio, (0, target_length - len(raw_audio)), mode='constant')
             logger.info(f"Padded audio from {len(raw_audio)} to {len(padded_audio)} samples")
         elif len(raw_audio) > target_length:
-            # Truncate if too long
             padded_audio = raw_audio[:target_length]
             logger.info(f"Truncated audio from {len(raw_audio)} to {len(padded_audio)} samples")
         else:
             padded_audio = raw_audio
-            logger.info("Audio length matches expected size")
         
         # Add batch dimension: (1, 160000)
         model_input = padded_audio[np.newaxis, :]
-        logger.info(f"Final model input shape: {model_input.shape}")
         
         # Convert to tensor
         input_tensor = tf.convert_to_tensor(model_input, dtype=tf.float32)
         
-        # Make prediction using the correct input format
+        # ── Inference with timing ───────────────────────────────────
         try:
+            t0 = time.perf_counter()
+            
             if hasattr(aqualisten_model, 'signatures') and 'serving_default' in aqualisten_model.signatures:
-                # Use the serving signature with named input
                 input_dict = {'inputs': input_tensor}
                 prediction = aqualisten_model.signatures['serving_default'](**input_dict)
-                logger.info("✅ AquaListen prediction successful!")
             else:
-                # Direct call
                 prediction = aqualisten_model(input_tensor)
-                logger.info("✅ AquaListen direct prediction successful!")
             
-            # Extract predictions
+            inference_ms = (time.perf_counter() - t0) * 1000
+            logger.info(f"✅ SurfPerch inference: {inference_ms:.1f} ms")
+            
+            # ── Extract outputs ──────────────────────────────────────
             if isinstance(prediction, dict):
-                # Model has multiple outputs, let's examine them
-                logger.info(f"Prediction outputs: {list(prediction.keys())}")
-                
-                # Try to use the most relevant output
-                # output_0 has shape (None, 10932) - likely class probabilities
-                # output_1 has shape (None, 1280) - likely embeddings
-                
+                # output_0: (1, 10932) taxonomic class logits
+                # output_1: (1, 1280) embedding vector
                 if 'output_0' in prediction:
                     predictions = prediction['output_0'].numpy()
-                    logger.info(f"Using output_0 with shape: {predictions.shape}")
                 else:
-                    # Use first available output
                     output_key = list(prediction.keys())[0]
                     predictions = prediction[output_key].numpy()
-                    logger.info(f"Using {output_key} with shape: {predictions.shape}")
+                
+                # ── Preserve embedding for future use ───────────────
+                # TODO: Train a lightweight classifier (Random Forest / SVM)
+                # on output_1 embeddings → {healthy, stressed, ambient}.
+                # This would outperform handcrafted rules from output_0 logits.
+                global latest_embedding
+                if 'output_1' in prediction:
+                    latest_embedding = prediction['output_1'].numpy()
+                    logger.debug(f"Embedding cached: shape {latest_embedding.shape}")
             else:
                 predictions = prediction.numpy()
             
-            logger.info(f"AquaListen raw predictions shape: {predictions.shape}")
-            
-            # Process predictions
             return process_aqualisten_predictions(predictions)
             
         except Exception as prediction_error:
@@ -318,9 +392,11 @@ def process_aqualisten_predictions(predictions):
         top_probs = class_probs[top_indices]
         top_log_probs = log_probs[top_indices]
         
-        logger.info(f"Top {top_k} AquaListen predictions:")
-        for i, (idx, prob, log_prob) in enumerate(zip(top_indices, top_probs, top_log_probs)):
-            logger.info(f"  {i+1}. Class {idx}: {prob:.6f} (log: {log_prob:.4f})")
+        # Top-10 class predictions — only in debug mode to avoid log flooding
+        if DEBUG_PREDICTIONS or logger.isEnabledFor(logging.DEBUG):
+            logger.info(f"Top {top_k} AquaListen predictions:")
+            for i, (idx, prob, log_prob) in enumerate(zip(top_indices, top_probs, top_log_probs)):
+                logger.info(f"  {i+1}. Class {idx}: {prob:.6f} (log: {log_prob:.4f})")
         
         # Map taxonomic predictions to reef health
         # This is a heuristic mapping based on marine biology knowledge
@@ -383,6 +459,8 @@ def process_aqualisten_predictions(predictions):
             confidence = 0.60 + norm_entropy * 0.15
         
         # Ensure confidence is in valid range
+        # TODO: Consider temperature scaling or Platt calibration for production.
+        # Handcrafted confidence mappings tend to be optimistic.
         confidence = np.clip(confidence, 0.5, 0.95)
         
         logger.info(f"AquaListen health mapping: {health_status} (confidence: {confidence:.3f})")
@@ -392,74 +470,232 @@ def process_aqualisten_predictions(predictions):
         logger.error(f"Error processing AquaListen predictions: {e}")
         return None, None
 
-def detect_mechanical_stress(audio_features):
+def _score_below(value, threshold, ramp_width=None):
     """
-    Detect mechanical stress indicators (boat noise, low-frequency dominance)
+    Linear ramp scoring: returns 1.0 when value is well below threshold,
+    0.0 when well above. Smooth transition over ramp_width.
+    
+    Used for features where LOWER values indicate anthropogenic noise
+    (e.g., spectral centroid, bandwidth, ZCR).
+    """
+    if ramp_width is None:
+        ramp_width = threshold
+    upper = threshold + ramp_width / 2
+    lower = threshold - ramp_width / 2
+    if value <= lower:
+        return 1.0
+    if value >= upper:
+        return 0.0
+    return float((upper - value) / (upper - lower))
+
+
+def _score_above(value, threshold, ramp_width=0.20):
+    """
+    Linear ramp scoring: returns 1.0 when value is well above threshold,
+    0.0 when well below. Smooth transition over ramp_width.
+    
+    Used for features where HIGHER values indicate anthropogenic noise
+    (e.g., low-frequency energy ratio).
+    """
+    upper = threshold + ramp_width / 2
+    lower = threshold - ramp_width / 2
+    if value >= upper:
+        return 1.0
+    if value <= lower:
+        return 0.0
+    return float((value - lower) / (upper - lower))
+
+
+def compute_anthropogenic_noise_score(audio_features):
+    """
+    Compute a continuous anthropogenic noise score in [0.0, 1.0].
+    
+    Replaces the old binary detect_mechanical_stress() function.
+    Uses 4 weighted acoustic indicators with smooth linear ramps
+    instead of hard binary thresholds.
+    
+    Returns:
+        dict with per-indicator scores, total score, and raw feature values.
+    
+    Design rationale:
+        - Each indicator produces a partial score via linear ramp (not binary)
+        - Weighted sum ensures no single indicator can trigger alone
+        - Low-freq energy ratio is the strongest signal (PAM literature)
+        - ZCR has minimal weight (unreliable for impulsive marine sounds)
+        - RMS excluded entirely (recording-dependent, loud whale ≠ engine)
     """
     try:
-        # Get spectral features
+        # ── Extract raw acoustic features ────────────────────────────
         spectral_centroid = np.mean(audio_features.get('spectral_centroid', [1500]))
         spectral_bandwidth = np.mean(audio_features.get('spectral_bandwidth', [1000]))
         zero_crossing_rate = np.mean(audio_features.get('zero_crossing_rate', [0.1]))
         
-        # Check for low-frequency dominance (boat noise, mechanical sounds)
-        low_freq_dominance = spectral_centroid < 1000  # Low frequencies (relaxed threshold)
-        narrow_bandwidth = spectral_bandwidth < 1000   # Narrow frequency range (relaxed)
-        low_zcr = zero_crossing_rate < 0.08            # Low zero crossing (relaxed)
+        # ── Compute low-frequency energy ratio ──────────────────────
+        # Strongest anthropogenic indicator (Merchant et al. 2015).
+        # Boat engines concentrate >80% of energy below 500 Hz.
+        raw_audio = audio_features.get('raw_audio')
+        sr = audio_features.get('sample_rate', 16000)
+        low_freq_ratio = 0.0
         
-        # Mechanical stress indicators
-        mechanical_indicators = 0
-        
-        if low_freq_dominance:
-            mechanical_indicators += 1
-            logger.info(f"Low frequency dominance detected: {spectral_centroid:.1f} Hz")
-        
-        if narrow_bandwidth:
-            mechanical_indicators += 1
-            logger.info(f"Narrow bandwidth detected: {spectral_bandwidth:.1f} Hz")
+        if raw_audio is not None and len(raw_audio) > 0:
+            fft_magnitudes = np.abs(np.fft.rfft(raw_audio)) ** 2
+            freqs = np.fft.rfftfreq(len(raw_audio), d=1.0 / sr)
             
-        if low_zcr:
-            mechanical_indicators += 1
-            logger.info(f"Low zero crossing rate detected: {zero_crossing_rate:.4f}")
+            low_freq_mask = freqs <= ANTHRO_LOWFREQ_CUTOFF
+            low_freq_energy = np.sum(fft_magnitudes[low_freq_mask])
+            total_energy = np.sum(fft_magnitudes) + 1e-10
+            
+            low_freq_ratio = low_freq_energy / total_energy
         
-        # Detect mechanical stress if 1+ indicators present (more sensitive)
-        is_mechanical_stress = mechanical_indicators >= 1
+        # ── Score each indicator via smooth linear ramp ─────────────
+        centroid_score = _score_below(
+            spectral_centroid, ANTHRO_CENTROID_THRESHOLD,
+            ramp_width=ANTHRO_CENTROID_THRESHOLD
+        )
+        bandwidth_score = _score_below(
+            spectral_bandwidth, ANTHRO_BANDWIDTH_THRESHOLD,
+            ramp_width=ANTHRO_BANDWIDTH_THRESHOLD
+        )
+        zcr_score = _score_below(
+            zero_crossing_rate, ANTHRO_ZCR_THRESHOLD,
+            ramp_width=ANTHRO_ZCR_THRESHOLD
+        )
+        lowfreq_score = _score_above(
+            low_freq_ratio, ANTHRO_LOWFREQ_RATIO_THRESHOLD,
+            ramp_width=0.20
+        )
         
-        if is_mechanical_stress:
-            logger.info("🚨 Mechanical stress detected (likely boat noise or machinery)")
-            logger.info(f"   Spectral centroid: {spectral_centroid:.1f} Hz")
-            logger.info(f"   Spectral bandwidth: {spectral_bandwidth:.1f} Hz") 
-            logger.info(f"   Zero crossing rate: {zero_crossing_rate:.4f}")
+        # ── Weighted sum ────────────────────────────────────────────
+        total_score = (
+            ANTHRO_WEIGHT_CENTROID * centroid_score +
+            ANTHRO_WEIGHT_BANDWIDTH * bandwidth_score +
+            ANTHRO_WEIGHT_ZCR * zcr_score +
+            ANTHRO_WEIGHT_LOWFREQ_RATIO * lowfreq_score
+        )
+        total_score = float(np.clip(total_score, 0.0, 1.0))
         
-        return is_mechanical_stress
+        # ── Per-indicator logging for debugging ─────────────────────
+        logger.info(f"Anthropogenic Noise Score: {total_score:.3f}")
+        logger.info(f"  Centroid Score:  {centroid_score:.3f}  (raw: {spectral_centroid:.1f} Hz, threshold: {ANTHRO_CENTROID_THRESHOLD} Hz)")
+        logger.info(f"  Bandwidth Score: {bandwidth_score:.3f}  (raw: {spectral_bandwidth:.1f} Hz, threshold: {ANTHRO_BANDWIDTH_THRESHOLD} Hz)")
+        logger.info(f"  ZCR Score:       {zcr_score:.3f}  (raw: {zero_crossing_rate:.4f}, threshold: {ANTHRO_ZCR_THRESHOLD})")
+        logger.info(f"  LowFreq Score:   {lowfreq_score:.3f}  (raw ratio: {low_freq_ratio:.3f}, threshold: {ANTHRO_LOWFREQ_RATIO_THRESHOLD})")
+        
+        return {
+            'total_score': total_score,
+            'centroid_score': centroid_score,
+            'bandwidth_score': bandwidth_score,
+            'zcr_score': zcr_score,
+            'lowfreq_ratio_score': lowfreq_score,
+            'low_freq_ratio': float(low_freq_ratio),
+            'indicators': {
+                'spectral_centroid_hz': float(spectral_centroid),
+                'spectral_bandwidth_hz': float(spectral_bandwidth),
+                'zero_crossing_rate': float(zero_crossing_rate),
+                'low_freq_ratio': float(low_freq_ratio)
+            }
+        }
         
     except Exception as e:
-        logger.error(f"Error in mechanical stress detection: {e}")
-        return False
+        logger.error(f"Error computing anthropogenic noise score: {e}")
+        return {
+            'total_score': 0.0, 'centroid_score': 0.0,
+            'bandwidth_score': 0.0, 'zcr_score': 0.0,
+            'lowfreq_ratio_score': 0.0, 'low_freq_ratio': 0.0,
+            'indicators': {}
+        }
 
 def classify_reef_health(audio_features, filename="unknown"):
     """
-    Classify reef health using AquaListen model or feature analysis
+    Classify reef health using AquaListen model with anthropogenic noise fusion.
+    
+    Returns:
+        tuple: (health_status, confidence, diagnostics)
+            - health_status: 'healthy', 'stressed', or 'ambient'
+            - confidence: float in [0.50, 0.95]
+            - diagnostics: dict preserving ml_prediction, ml_confidence,
+              anthropogenic_score, fusion_decision for debugging/demos
     """
+    
+    # Default diagnostics — always returned for transparency
+    diagnostics = {
+        'ml_prediction': None,
+        'ml_confidence': None,
+        'anthropogenic_score': 0.0,
+        'anthropogenic_details': {},
+        'fusion_decision': 'no_model',
+        'prediction_source': 'fallback'
+    }
     
     try:
         # Method 1: Try AquaListen model first if loaded
         if model_loaded and aqualisten_model is not None and audio_features is not None:
             logger.info("Attempting AquaListen model prediction...")
             
-            # Check for mechanical noise indicators first
-            mechanical_stress = detect_mechanical_stress(audio_features)
+            # Compute anthropogenic noise score (continuous, not binary)
+            anthro_result = compute_anthropogenic_noise_score(audio_features)
+            anthro_score = anthro_result['total_score']
             
+            # Get ML prediction from SurfPerch
             health_status, confidence = predict_with_aqualisten_model(audio_features)
             
             if health_status is not None and confidence is not None:
-                # Override with mechanical stress detection if detected
-                if mechanical_stress and health_status != 'stressed':
-                    logger.info("Mechanical stress detected, overriding AquaListen prediction")
-                    return 'stressed', min(0.85, confidence + 0.1)
+                # Record original ML prediction BEFORE any modification
+                diagnostics['ml_prediction'] = health_status
+                diagnostics['ml_confidence'] = float(confidence)
+                diagnostics['anthropogenic_score'] = anthro_score
+                diagnostics['anthropogenic_details'] = anthro_result
+                diagnostics['prediction_source'] = 'surfperch'
                 
-                logger.info(f"✅ AquaListen prediction successful: {health_status} ({confidence:.2f})")
-                return health_status, confidence
+                # ── Graduated Fusion Policy ─────────────────────────
+                # ML model is the primary authority. Anthropogenic score
+                # is an advisory signal that modulates confidence.
+                
+                if anthro_score < ANTHRO_SCORE_WARN:
+                    # LOW anthropogenic evidence → trust ML completely
+                    diagnostics['fusion_decision'] = 'trust_ml'
+                    logger.info(f"Fusion: TRUST ML (anthro={anthro_score:.3f} < {ANTHRO_SCORE_WARN})")
+                    
+                elif anthro_score < ANTHRO_SCORE_MODERATE:
+                    # MILD anthropogenic evidence → reduce confidence 5-15%
+                    penalty = 0.05 + (anthro_score - ANTHRO_SCORE_WARN) / (ANTHRO_SCORE_MODERATE - ANTHRO_SCORE_WARN) * 0.10
+                    confidence = max(0.50, confidence - penalty)
+                    diagnostics['fusion_decision'] = f'mild_penalty({penalty:.3f})'
+                    logger.info(f"Fusion: MILD PENALTY (anthro={anthro_score:.3f}, penalty={penalty:.3f})")
+                    logger.info(f"  ⚠️ Possible anthropogenic noise interference")
+                    
+                elif anthro_score < ANTHRO_SCORE_OVERRIDE:
+                    # MODERATE anthropogenic evidence → reduce confidence 15-25%
+                    penalty = 0.15 + (anthro_score - ANTHRO_SCORE_MODERATE) / (ANTHRO_SCORE_OVERRIDE - ANTHRO_SCORE_MODERATE) * 0.10
+                    confidence = max(0.50, confidence - penalty)
+                    diagnostics['fusion_decision'] = f'moderate_penalty({penalty:.3f})'
+                    logger.info(f"Fusion: MODERATE PENALTY (anthro={anthro_score:.3f}, penalty={penalty:.3f})")
+                    logger.info(f"  ⚠️ Significant anthropogenic noise detected")
+                    
+                else:
+                    # STRONG anthropogenic evidence (score >= 0.8)
+                    # Override ONLY if ML confidence is below floor (uncertain)
+                    if confidence < ANTHRO_ML_CONFIDENCE_FLOOR:
+                        old_status = health_status
+                        health_status = 'stressed'
+                        confidence = max(0.50, anthro_score * 0.85)
+                        diagnostics['fusion_decision'] = f'override({old_status}→stressed)'
+                        logger.info(f"Fusion: OVERRIDE (anthro={anthro_score:.3f}, ml_conf={diagnostics['ml_confidence']:.3f} < {ANTHRO_ML_CONFIDENCE_FLOOR})")
+                        logger.info(f"  🚨 High anthro noise + low ML confidence → override to stressed")
+                    else:
+                        # ML is confident — trust it even with high anthro score
+                        penalty = 0.15
+                        confidence = max(0.50, confidence - penalty)
+                        diagnostics['fusion_decision'] = f'trust_confident_ml(penalty={penalty:.3f})'
+                        logger.info(f"Fusion: TRUST CONFIDENT ML (anthro={anthro_score:.3f}, ml_conf={diagnostics['ml_confidence']:.3f} >= {ANTHRO_ML_CONFIDENCE_FLOOR})")
+                
+                # Ensure confidence is in valid range
+                confidence = float(np.clip(confidence, 0.50, 0.95))
+                
+                # ── Summary log line ────────────────────────────────
+                logger.info(f"✅ Final: {health_status} ({confidence:.3f})  |  ML: {diagnostics['ml_prediction']} ({diagnostics['ml_confidence']:.3f})  |  Anthro: {anthro_score:.3f}  |  {diagnostics['fusion_decision']}")
+                
+                return health_status, confidence, diagnostics
             else:
                 logger.warning("AquaListen model prediction failed, falling back to feature analysis")
         
@@ -475,7 +711,8 @@ def classify_reef_health(audio_features, filename="unknown"):
                 if any(keyword in filename_lower for keyword in keywords):
                     confidence = 0.85 + np.random.normal(0, 0.05)  # Add some variation
                     confidence = np.clip(confidence, 0.7, 0.95)
-                    return health_type, float(confidence)
+                    diagnostics['prediction_source'] = 'filename_pattern'
+                    return health_type, float(confidence), diagnostics
         
         # Method 3: Analyze audio features
         if audio_features is not None:
@@ -485,15 +722,16 @@ def classify_reef_health(audio_features, filename="unknown"):
             zero_crossing_rate = np.mean(audio_features.get('zero_crossing_rate', [0.1]))
             
             # Simple rule-based classification based on acoustic characteristics
+            diagnostics['prediction_source'] = 'feature_analysis'
             if spectral_centroid > 2000 and spectral_bandwidth > 1500:
                 # High frequency activity suggests biological sounds
-                return 'healthy', 0.82 + np.random.normal(0, 0.08)
+                return 'healthy', 0.82 + np.random.normal(0, 0.08), diagnostics
             elif spectral_centroid < 1000 and zero_crossing_rate > 0.12:
                 # Low frequency with high zero crossing suggests mechanical noise
-                return 'stressed', 0.76 + np.random.normal(0, 0.06) 
+                return 'stressed', 0.76 + np.random.normal(0, 0.06), diagnostics
             else:
                 # Medium range suggests ambient sounds
-                return 'ambient', 0.71 + np.random.normal(0, 0.07)
+                return 'ambient', 0.71 + np.random.normal(0, 0.07), diagnostics
         
         # Method 4: Default classification with realistic distribution
         health_types = ['healthy', 'stressed', 'ambient']
@@ -502,12 +740,13 @@ def classify_reef_health(audio_features, filename="unknown"):
         selected_health = np.random.choice(health_types, p=weights)
         confidence = 0.75 + np.random.normal(0, 0.10)
         confidence = np.clip(confidence, 0.65, 0.92)
+        diagnostics['prediction_source'] = 'default_distribution'
         
-        return selected_health, float(confidence)
+        return selected_health, float(confidence), diagnostics
         
     except Exception as e:
         logger.error(f"Error in reef health classification: {e}")
-        return 'ambient', 0.70
+        return 'ambient', 0.70, diagnostics
 
 def extract_audio_features(audio, sr):
     """Extract acoustic features from audio"""
@@ -603,8 +842,8 @@ async def predict_reef_health(file: UploadFile = File(...)):
         # Extract features
         features = extract_audio_features(audio, sr)
         
-        # Classify reef health
-        health_status, confidence = classify_reef_health(features, file.filename)
+        # Classify reef health (returns 3-tuple with diagnostics)
+        health_status, confidence, diagnostics = classify_reef_health(features, file.filename)
         confidence_percent = round(confidence * 100, 1)
         
         logger.info(f"Classification complete: {health_status} ({confidence_percent}%)")
@@ -636,12 +875,27 @@ async def predict_reef_health(file: UploadFile = File(...)):
         # Prepare response
         processing_time = time.time() - start_time
         
+        # Build human-readable explanation
+        anthro_s = diagnostics.get('anthropogenic_score', 0.0)
+        fusion = diagnostics.get('fusion_decision', 'unknown')
+        if anthro_s < ANTHRO_SCORE_WARN:
+            explanation = "Low anthropogenic noise detected; ML prediction retained."
+        elif anthro_s < ANTHRO_SCORE_MODERATE:
+            explanation = "Mild anthropogenic noise interference; ML confidence slightly reduced."
+        elif anthro_s < ANTHRO_SCORE_OVERRIDE:
+            explanation = "Significant anthropogenic noise detected; ML confidence moderately reduced."
+        elif 'override' in fusion:
+            explanation = "Strong anthropogenic noise with low ML confidence; prediction overridden to stressed."
+        else:
+            explanation = "Strong anthropogenic noise detected but ML is confident; ML prediction retained with penalty."
+        
         return {
             "success": True,
             "prediction": {
                 "health_status": health_status,
                 "confidence": confidence,
-                "confidence_percentage": confidence_percent
+                "confidence_percentage": confidence_percent,
+                "explanation": explanation
             },
             "file_info": {
                 "filename": file.filename,
@@ -658,6 +912,13 @@ async def predict_reef_health(file: UploadFile = File(...)):
                 "spectral_centroid_hz": float(np.mean(features.get('spectral_centroid', [0]))),
                 "spectral_bandwidth_hz": float(np.mean(features.get('spectral_bandwidth', [0]))),
                 "zero_crossing_rate": float(np.mean(features.get('zero_crossing_rate', [0])))
+            },
+            "diagnostics": {
+                "ml_prediction": diagnostics.get('ml_prediction'),
+                "ml_confidence": diagnostics.get('ml_confidence'),
+                "anthropogenic_noise_score": anthro_s,
+                "fusion_decision": fusion,
+                "prediction_source": diagnostics.get('prediction_source', 'unknown')
             }
         }
         
@@ -683,11 +944,13 @@ async def batch_predict_reef_health(files: list[UploadFile] = File(...)):
     for file in files:
         try:
             # Process each file
+            logger.info(f"🔄 Batch processing: {file.filename}")
             audio_data = await file.read()
             audio, sr = librosa.load(io.BytesIO(audio_data), sr=16000, duration=5.0)
             
             features = extract_audio_features(audio, sr)
-            predicted_health, confidence = classify_reef_health(features, file.filename)
+            predicted_health, confidence, _diag = classify_reef_health(features, file.filename)
+            logger.info(f"✅ Batch result: {file.filename} → {predicted_health} ({confidence:.1%})")
             
             result = {
                 "filename": file.filename,
@@ -724,7 +987,7 @@ async def get_model_info():
     
     info = {
         "model_loaded": model_loaded,
-        "model_path": str(Path(__file__).parent / "savedmodel" / "saved_model.pb"),
+        "model_path": str(Path(__file__).parent / "models" / "savedmodel" / "saved_model.pb"),
         "classification_categories": ["healthy", "stressed", "ambient"],
         "supported_formats": [".wav", ".mp3", ".flac", ".m4a"],
         "max_file_size_mb": 50,
